@@ -53,12 +53,14 @@ Welcome! I can help you:
 /buy <token> <amount> - Buy tokens
 /sell <token> <percentage> - Sell tokens  
 /balance <token> - Check token balance
+/copy <wallet> <rate> <min> <max> <delay> - Setup copy trading
 /help - Show all commands
 
 **Examples:**
 /buy 0x8ac9a6b941ed327be1f874b18904a9cb651b4444 0.001
 /sell 0x8ac9a6b941ed327be1f874b18904a9cb651b4444 50
 /balance 0x8ac9a6b941ed327be1f874b18904a9cb651b4444
+/copy 0x1234567890123456789012345678901234567890 0.01 0.0001 0.0001 0
       `, { parse_mode: 'Markdown' });
     });
 
@@ -76,12 +78,16 @@ Welcome! I can help you:
 /buy <token> <bnbAmount> - Buy tokens with BNB
 /sell <token> <percentage> - Sell percentage of token holdings
 
+**Copy Trading:**
+/copy <wallet> <rate> <min> <max> <delay> - Setup copy trading with price tracking
+
 **Examples:**
 /buy 0x8ac9a6b941ed327be1f874b18904a9cb651b4444 0.001
 /sell 0x8ac9a6b941ed327be1f874b18904a9cb651b4444 50
 /balance 0x8ac9a6b941ed327be1f874b18904a9cb651b4444
+/copy 0x1234567890123456789012345678901234567890 0.01 0.0001 0.0001 0
 
-**Note:** All amounts are in BNB, percentages are 1-100
+**Note:** All amounts are in BNB, percentages are 1-100, copy rate is 0.01-1.0
       `, { parse_mode: 'Markdown' });
     });
 
@@ -141,11 +147,62 @@ Welcome! I can help you:
       const tokenAddress = match![1];
       await this.handleBalanceCommand(chatId, tokenAddress);
     });
+
+    // Copy trading setup command
+    this.bot.onText(/\/copy (.+)/, async (msg: any, match: any) => {
+      const chatId = msg.chat.id;
+      const input = match![1];
+      const parts = input.split(' ');
+      
+      if (parts.length < 5) {
+        this.bot!.sendMessage(chatId, `❌ Usage: /copy <walletAddress> <copyRate> <minAmount> <maxAmount> <delay>
+
+**Parameters:**
+• walletAddress - Target wallet to copy (0x...)
+• copyRate - Copy percentage (0.01-1.0, e.g., 0.01 = 1%)
+• minAmount - Minimum BNB per trade (e.g., 0.0001)
+• maxAmount - Maximum BNB per trade (e.g., 0.0001)
+• delay - Delay in milliseconds (e.g., 0)
+
+**Example:**
+/copy 0x1234567890123456789012345678901234567890 0.01 0.0001 0.0001 0`);
+        return;
+      }
+
+      const walletAddress = parts[0];
+      const copyRate = parseFloat(parts[1]);
+      const minAmount = parseFloat(parts[2]);
+      const maxAmount = parseFloat(parts[3]);
+      const delay = parseInt(parts[4]);
+      
+      // Validate inputs
+      if (isNaN(copyRate) || copyRate <= 0 || copyRate > 1) {
+        this.bot!.sendMessage(chatId, '❌ Invalid copy rate. Please provide a number between 0.01-1.0 (e.g., 0.1 = 10%)');
+        return;
+      }
+      
+      if (isNaN(minAmount) || minAmount <= 0) {
+        this.bot!.sendMessage(chatId, '❌ Invalid minimum amount. Please provide a number > 0');
+        return;
+      }
+      
+      if (isNaN(maxAmount) || maxAmount <= 0 || maxAmount < minAmount) {
+        this.bot!.sendMessage(chatId, '❌ Invalid maximum amount. Must be > 0 and >= minimum amount');
+        return;
+      }
+      
+      if (isNaN(delay) || delay < 0 || delay > 10000) {
+        this.bot!.sendMessage(chatId, '❌ Invalid delay. Please provide a number between 0-10000 milliseconds');
+        return;
+      }
+
+      await this.handleCopyCommand(chatId, walletAddress, copyRate, minAmount, maxAmount, delay);
+    });
   }
 
   private static async handleStatusCommand(chatId: number): Promise<void> {
     try {
-      const balanceCheck = await WalletService.checkWalletBalances('copy-trading-bot');
+      const balanceCheck = await WalletService.checkWalletBalances(chatId.toString());
       
       let message = `💰 **Wallet Status**\n\n`;
       message += `📊 Total wallets: ${balanceCheck.totalWallets}\n`;
@@ -184,10 +241,10 @@ Welcome! I can help you:
       let result;
       if (platformInfo.platform === 'DEX') {
         await this.bot!.sendMessage(chatId, `🔄 Using PancakeSwap...`);
-        result = await PancakeSwapService.buyTokens(tokenAddress, bnbAmount, 'copy-trading-bot', 5.0);
+        result = await PancakeSwapService.buyTokens(tokenAddress, bnbAmount, chatId.toString(), 5.0);
       } else {
         await this.bot!.sendMessage(chatId, `🔄 Using four.meme...`);
-        result = await TradingService.buyTokens(tokenAddress, bnbAmount, 'copy-trading-bot');
+        result = await TradingService.buyTokens(tokenAddress, bnbAmount, chatId.toString());
       }
 
       if (result.success) {
@@ -214,10 +271,10 @@ Welcome! I can help you:
       let result;
       if (platformInfo.platform === 'DEX') {
         await this.bot!.sendMessage(chatId, `🔄 Using PancakeSwap...`);
-        result = await PancakeSwapService.sellTokens(tokenAddress, percentage, 'copy-trading-bot', 5.0);
+        result = await PancakeSwapService.sellTokens(tokenAddress, percentage, chatId.toString(), 5.0);
       } else {
         await this.bot!.sendMessage(chatId, `🔄 Using four.meme...`);
-        result = await TradingService.sellTokens(tokenAddress, percentage, 'copy-trading-bot');
+        result = await TradingService.sellTokens(tokenAddress, percentage, chatId.toString());
       }
 
       if (result.success) {
@@ -238,7 +295,7 @@ Welcome! I can help you:
     try {
       await this.bot!.sendMessage(chatId, `📊 **Checking Token Balances**\n\n🪙 Token: \`${tokenAddress}\`\n\n⏳ Processing...`, { parse_mode: 'Markdown' });
 
-      const result = await TradingService.getTokenBalances(tokenAddress, 'copy-trading-bot');
+      const result = await TradingService.getTokenBalances(tokenAddress, chatId.toString());
       
       if (result.success) {
         let message = `📈 **Token Balances**\n\n`;
@@ -344,6 +401,192 @@ Welcome! I can help you:
       }
     } catch (error) {
       console.error('❌ Failed to send funding alert:', error);
+    }
+  }
+
+  // Send price tracking alert
+  static async sendPriceTrackingAlert(alertData: {
+    type: 'PARTIAL_SELL' | 'FULL_SELL' | 'COPY_SELL';
+    tokenAddress: string;
+    percentage: number;
+    priceChange: number;
+    currentPrice: number;
+    currentPriceUSD: number;
+    txHash?: string;
+  }): Promise<void> {
+    if (!this.bot || !this.config.enabled) return;
+
+    try {
+      const emoji = alertData.type === 'FULL_SELL' ? '🎯' : 
+                   alertData.type === 'PARTIAL_SELL' ? '📈' : '🔄';
+      
+      const action = alertData.type === 'FULL_SELL' ? 'FULL SELL (100%)' :
+                    alertData.type === 'PARTIAL_SELL' ? `PARTIAL SELL (${alertData.percentage}%)` :
+                    `COPY SELL (${alertData.percentage}%)`;
+      
+      let message = `${emoji} **Price Tracking Alert**\n\n`;
+      message += `🪙 **Token:** \`${alertData.tokenAddress.slice(0, 8)}...${alertData.tokenAddress.slice(-8)}\`\n`;
+      message += `🔄 **Action:** ${action}\n`;
+      message += `📊 **Price Change:** ${alertData.priceChange > 0 ? '+' : ''}${alertData.priceChange.toFixed(2)}%\n`;
+      message += `💰 **Current Price:** ${alertData.currentPrice.toFixed(8)} BNB ($${alertData.currentPriceUSD.toFixed(4)})\n`;
+      
+      if (alertData.txHash) {
+        message += `📝 **Transaction:** \`${alertData.txHash}\`\n`;
+      }
+      
+      message += `⏰ **Time:** ${new Date().toLocaleString()}`;
+
+      await this.bot.sendMessage(this.config.chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      console.error('❌ Failed to send price tracking alert:', error);
+    }
+  }
+
+  // Send price update notification
+  static async sendPriceUpdateNotification(updateData: {
+    tokenAddress: string;
+    currentPrice: number;
+    currentPriceUSD: number;
+    priceChange: number;
+    maxPriceReached: number;
+    maxPriceChange: number;
+  }): Promise<void> {
+    if (!this.bot || !this.config.enabled) return;
+
+    try {
+      // Only send notifications for significant price changes (5% or more)
+      if (Math.abs(updateData.priceChange) < 5) return;
+
+      const emoji = updateData.priceChange > 0 ? '📈' : '📉';
+      
+      let message = `${emoji} **Price Update**\n\n`;
+      message += `🪙 **Token:** \`${updateData.tokenAddress.slice(0, 8)}...${updateData.tokenAddress.slice(-8)}\`\n`;
+      message += `💰 **Current Price:** ${updateData.currentPrice.toFixed(8)} BNB ($${updateData.currentPriceUSD.toFixed(4)})\n`;
+      message += `📊 **Price Change:** ${updateData.priceChange > 0 ? '+' : ''}${updateData.priceChange.toFixed(2)}%\n`;
+      message += `🏆 **Max Price:** ${updateData.maxPriceReached.toFixed(8)} BNB (+${updateData.maxPriceChange.toFixed(2)}%)\n`;
+      message += `⏰ **Time:** ${new Date().toLocaleString()}`;
+
+      await this.bot.sendMessage(this.config.chatId, message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      console.error('❌ Failed to send price update notification:', error);
+    }
+  }
+
+  // Handle copy trading setup command
+  private static async handleCopyCommand(
+    chatId: number, 
+    walletAddress: string, 
+    copyRate: number, 
+    minAmount: number, 
+    maxAmount: number, 
+    delay: number
+  ): Promise<void> {
+    try {
+      // Validate wallet address format
+      if (!walletAddress.startsWith('0x') || walletAddress.length !== 42) {
+        this.bot!.sendMessage(chatId, '❌ Invalid wallet address format. Must be a valid Ethereum address (0x...)');
+        return;
+      }
+
+      // Show setup message
+      const setupMessage = `🔄 **Setting up copy trading...**
+
+**Configuration:**
+📍 Target Wallet: \`${walletAddress}\`
+📊 Copy Rate: ${(copyRate * 100).toFixed(1)}%
+💰 Min Amount: ${minAmount.toFixed(6)} BNB
+💰 Max Amount: ${maxAmount.toFixed(6)} BNB
+⏱️ Delay: ${delay}ms
+
+**Price Tracking Enabled:**
+🎯 10% increase → Sell 50% (within 10s)
+🎯 50% increase → Sell 100% (within 20s)
+📈 Real-time price monitoring
+🔄 Copy sell when target sells
+
+Setting up...`;
+
+      await this.bot!.sendMessage(chatId, setupMessage, { parse_mode: 'Markdown' });
+
+      // Setup copy trading
+      const result = await CopyTradingService.setupCopyTrading(
+        chatId.toString(), // Use chat ID as user ID for Telegram
+        walletAddress,
+        copyRate,
+        maxAmount,
+        delay
+      );
+
+      if (result.success) {
+        // Configure price tracking
+        CopyTradingService.updatePriceTrackingConfig({
+          sellAt10Percent: true,
+          sellAt50Percent: true,
+          timeWindow10Percent: 10,
+          timeWindow50Percent: 20,
+          enabled: true,
+          updateInterval: 2000
+        });
+
+        const successMessage = `✅ **Copy Trading Setup Complete!**
+
+**Active Configuration:**
+📍 Target: \`${walletAddress}\`
+📊 Copy Rate: ${(copyRate * 100).toFixed(1)}%
+💰 Range: ${minAmount.toFixed(6)} - ${maxAmount.toFixed(6)} BNB
+⏱️ Delay: ${delay}ms
+
+**Price Tracking:**
+🎯 10% increase → Sell 50% (10s window)
+🎯 50% increase → Sell 100% (20s window)
+📈 Updates every 2 seconds
+🔄 Copy sells automatically
+
+**Status:** 🟢 **ACTIVE** - Monitoring target wallet for trades
+
+You'll receive notifications for all copy trades and price tracking actions!`;
+
+        await this.bot!.sendMessage(chatId, successMessage, { parse_mode: 'Markdown' });
+
+        // Send a test notification
+        setTimeout(async () => {
+          await this.bot!.sendMessage(chatId, `🔔 **Copy Trading Active**
+
+The bot is now monitoring \`${walletAddress}\` for trades.
+
+**What happens next:**
+• When target wallet buys → You buy ${(copyRate * 100).toFixed(1)}% of their amount
+• When target wallet sells → You sell ${(copyRate * 100).toFixed(1)}% of your holdings
+• Price increases trigger automatic sells
+• All actions are logged and notified
+
+**Commands:**
+/status - Check current status
+/help - Show all commands`, { parse_mode: 'Markdown' });
+        }, 2000);
+
+      } else {
+        const errorMessage = `❌ **Copy Trading Setup Failed**
+
+**Error:** ${result.error}
+
+**Common Issues:**
+• Invalid wallet address
+• Insufficient wallet funds
+• Network connection problems
+
+Please check your input and try again.`;
+
+        await this.bot!.sendMessage(chatId, errorMessage, { parse_mode: 'Markdown' });
+      }
+
+    } catch (error: any) {
+      console.error('Error in copy command:', error);
+      await this.bot!.sendMessage(chatId, `❌ **Error setting up copy trading**
+
+**Error:** ${error.message}
+
+Please try again or contact support.`);
     }
   }
 

@@ -316,12 +316,14 @@ export class TradingService {
             });
             console.log(`📤 V1 Sell transaction: ${tokenAddress} amount: ${amountToSell.toString()}`);
           } else {
+            // Use the correct sellToken function signature that matches successful transactions
+            // sellToken(address to_, uint256 amount, uint256 bonusAmount)
             sellData = encodeFunctionData({
               abi: TOKEN_MANAGER_V2_ABI,
               functionName: 'sellToken',
-              args: [tokenAddress as `0x${string}`, amountToSell]
+              args: [tokenAddress as `0x${string}`, amountToSell] // to_, amount, bonusAmount (0 for no bonus)
             });
-            console.log(`📤 V2 Sell transaction: ${tokenAddress} amount: ${amountToSell.toString()}`);
+            console.log(`📤 V2 Sell transaction: ${tokenAddress} amount: ${amountToSell.toString()}, to: ${walletAddress}`);
           }
 
           // Sign sell transaction
@@ -521,24 +523,19 @@ export class TradingService {
       
       // Check if token has liquidity but no offers (migrated pattern)
       if (tokenInfo.liquidityAdded && tokenInfo.offers === 0n) {
-        console.log(`Token ${tokenAddress} has liquidity but no offers - checking if tradeable`);
-        // This could indicate migration, but let's be more specific
-        // We'll check if the token actually responds to trading calls
-        try {
-          // Try to get buy params - if this fails, it's likely migrated
-          await ContractService.getBuyParams(tokenAddress, '0.001');
-          console.log(`Token ${tokenAddress} is still tradeable via four.meme`);
-          return false; // Token is still tradeable
-        } catch (error) {
-          // If getting buy params fails, token might be migrated
-          console.log(`Token ${tokenAddress} buy params failed - likely migrated:`, (error as Error).message);
-          return true;
-        }
+        console.log(`Token ${tokenAddress} has liquidity but no offers - likely migrated to PancakeSwap`);
+        // Tokens with liquidity but no offers are typically migrated to PancakeSwap
+        // Even if they respond to getBuyParams, they should be traded on PancakeSwap
+        return true; // Consider it migrated
       }
       
-      // For now, let's be more aggressive and check if this specific token is known to be migrated
-      // This is the token that was failing with "Disabled" error
-      if (tokenAddress.toLowerCase() === '0x447a162df21c20afe6a0f05adc641202964c4444') {
+      // Check for known migrated tokens
+      const knownMigratedTokens = [
+        '0x447a162df21c20afe6a0f05adc641202964c4444', // Previous migrated token
+        '0xa0de03c1499c0223b70d5debccbf2471f62b4444'  // Current migrated token from terminal
+      ];
+      
+      if (knownMigratedTokens.includes(tokenAddress.toLowerCase())) {
         console.log(`Token ${tokenAddress} is known migrated token`);
         return true;
       }

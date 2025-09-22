@@ -1,8 +1,8 @@
-const { CopyTradingService } = require('./dist/services/copyTrading');
-const { WalletService } = require('./dist/services/wallet');
-const { TradingService } = require('./dist/services/trading');
-const { PancakeSwapService } = require('./dist/services/pancakeSwap');
-const { TelegramBotService } = require('./dist/services/telegramBot');
+const { CopyTradingService } = require('../dist/services/copyTrading');
+const { WalletService } = require('../dist/services/wallet');
+const { TradingService } = require('../dist/services/trading');
+const { PancakeSwapService } = require('../dist/services/pancakeSwap');
+const { TelegramBotService } = require('../dist/services/telegramBot');
 const dotenv = require('dotenv');
 
 // Load environment variables

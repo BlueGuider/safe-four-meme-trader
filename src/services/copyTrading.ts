@@ -7,6 +7,9 @@ import { decodeFunctionData } from 'viem';
 import { TOKEN_MANAGER_V1_ABI, TOKEN_MANAGER_V2_ABI } from '../contracts/abis';
 import SwapX_ABI from '../contracts/abis/SwapX_ABI.json';
 import { TelegramBotService } from './telegramBot';
+import { PriceTrackingService } from './priceTrackingService';
+import { DirectPriceService } from './directPriceService';
+import { CSVLogger } from './csvLogger';
 
 export interface CopyTradingConfig {
   targetWallet: string;
@@ -42,6 +45,8 @@ export class CopyTradingService {
   private static monitoringInterval: NodeJS.Timeout | null = null;
   private static lastProcessedBlock = 0;
   private static testingMode = false; // Set to false to enable actual trading
+  private static priceTrackingService: PriceTrackingService = PriceTrackingService.getInstance();
+  private static csvLogger: CSVLogger = CSVLogger.getInstance();
 
   /**
    * Setup copy trading for a user
@@ -49,9 +54,9 @@ export class CopyTradingService {
   static async setupCopyTrading(
     userId: string,
     targetWallet: string,
-    copyRatio: number = 0.1,
-    maxPositionSize: number = 0.1,
-    delayMs: number = 2000
+    copyRatio: number = 0.01,
+    maxPositionSize: number = 0.0001,
+    delayMs: number = 0
   ): Promise<{ success: boolean; error?: string }> {
     try {
       // Validate target wallet
@@ -74,10 +79,10 @@ export class CopyTradingService {
         targetWallet: targetWallet.toLowerCase(),
         copyRatio,
         maxPositionSize,
-        minPositionSize: 0.0005, // Minimum 0.001 BNB
+        minPositionSize: 0.0001, // Minimum 0.0001 BNB
         enabled: true,
         delayMs: Math.min(delayMs, 5000), // Max 5 second delay
-        maxDailyLoss: 1.0, // 1 BNB max daily loss
+        maxDailyLoss: 0.1, // 0.1 BNB max daily loss
         allowedTokens: [], // Empty = all tokens
         blockedTokens: []
       };
@@ -108,14 +113,14 @@ export class CopyTradingService {
     console.log(`🧪 Mode: ${this.testingMode ? 'SIMULATION' : 'LIVE TRADING'}`);
     console.log('');
 
-    // Poll every 1 second for new transactions (faster response)
+    // Poll every 300ms for new transactions (faster response)
     this.monitoringInterval = setInterval(async () => {
       try {
         await this.checkForNewTransactions();
       } catch (error) {
         console.error('Error in copy trading monitoring:', error);
       }
-    }, 1000);
+    }, 300);
   }
 
   /**
@@ -125,11 +130,11 @@ export class CopyTradingService {
     try {
       const defaultConfig: CopyTradingConfig = {
         targetWallet,
-        copyRatio: 0.1, // 10%
-        maxPositionSize: 1.0, // 1 BNB max
-        minPositionSize: 0.0005, // 0.001 BNB min
+        copyRatio: 0.01, // 1%
+        maxPositionSize: 0.0001, // 0.0001 BNB max
+        minPositionSize: 0.0001, // 0.0001 BNB min
         enabled: true,
-        delayMs: 1000, // 1 second delay
+        delayMs: 0, // No delay
         maxDailyLoss: 0.1, // 10% max daily loss
         allowedTokens: [],
         blockedTokens: [],
@@ -283,28 +288,45 @@ export class CopyTradingService {
         return;
       }
 
-      // Check if this is a known trading contract
+      // Check if this is a known trading contract OR a token contract
       const isKnownContract = await this.isKnownTradingContract(toAddress);
-      if (!isKnownContract) {
-        console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Not a known trading contract (${toAddress})`);
+      const isTokenContract = await this.isTokenContract(toAddress);
+      
+      if (!isKnownContract && !isTokenContract) {
+        console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Not a known trading or token contract (${toAddress})`);
         return;
       }
 
       // Parse transaction data to determine if it's a buy or sell
-      const tradeInfo = await this.parseTransactionData(tx);
+      console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Parsing transaction data...`);
+      console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${tx.input?.slice(0, 10)}...`);
+      
+      let tradeInfo = await this.parseTransactionData(tx);
       if (!tradeInfo) {
-        console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data`);
-        return;
+        console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data, trying internal transaction analysis`);
+        tradeInfo = await this.analyzeInternalTransactions(tx);
+        if (!tradeInfo) {
+          console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not determine trade type from internal transactions`);
+          return;
+        }
       }
+      
+      console.log(`   ✅ Transaction ${tx.hash?.slice(0, 10)}...: Parsed as ${tradeInfo.type} trade`);
+      console.log(`   📊 Trade info: token=${tradeInfo.tokenAddress}, bnbAmount=${tradeInfo.bnbAmount}, tokenAmount=${tradeInfo.tokenAmount || 'N/A'}`);
 
       // Check if token is allowed/blocked
+      console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Checking if token is allowed...`);
       if (!this.isTokenAllowed(config, tradeInfo.tokenAddress)) {
         console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Token not allowed`);
         return;
       }
+      console.log(`   ✅ Transaction ${tx.hash?.slice(0, 10)}...: Token is allowed`);
 
       // Determine trading platform and validate accordingly
+      console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Determining trading platform for token ${tradeInfo.tokenAddress}...`);
       const platformInfo = await this.determineTradingPlatform(tradeInfo.tokenAddress);
+      console.log(`   📊 Transaction ${tx.hash?.slice(0, 10)}...: Platform: ${platformInfo.platform}, Tradeable: ${platformInfo.isTradeable}`);
+      
       if (!platformInfo.isTradeable) {
         if (platformInfo.platform === 'DEX') {
           console.log(`   ⚠️  Transaction ${tx.hash?.slice(0, 10)}...: Token migrated to PancakeSwap - will attempt PancakeSwap trade`);
@@ -313,14 +335,44 @@ export class CopyTradingService {
           return;
         }
       }
+      console.log(`   ✅ Transaction ${tx.hash?.slice(0, 10)}...: Token is tradeable, proceeding with copy trade`);
 
-      // Calculate copy amount
-      const copyAmount = Math.min(
-        tradeInfo.bnbAmount * config.copyRatio,
-        config.maxPositionSize
-      );
+      // Calculate copy amount based on trade type
+      let copyAmount: number;
+      
+      if (tradeInfo.type === 'SELL') {
+        // For SELL transactions, we need to check if we have tokens to sell
+        console.log(`   📊 SELL transaction detected - checking our token holdings...`);
+        console.log(`   📊 Target wallet sold ${tradeInfo.tokenAmount?.toFixed(2) || 'unknown'} tokens`);
+        
+        // Skip if we don't have token amount info
+        if (!tradeInfo.tokenAmount || tradeInfo.tokenAmount <= 0) {
+          console.log(`   ❌ No token amount information available for SELL transaction, skipping`);
+          return;
+        }
+        
+        // For SELL, we'll use a fixed small amount since we can't determine BNB value
+        copyAmount = Math.min(config.maxPositionSize, 0.001); // Use 0.001 BNB as default for sells
+        console.log(`   💰 SELL copy amount: ${copyAmount.toFixed(6)} BNB (fixed amount for sell trades)`);
+        
+        if (copyAmount < config.minPositionSize) {
+          console.log(`   ❌ SELL copy amount too small (${copyAmount.toFixed(6)} < ${config.minPositionSize}), skipping trade`);
+          return;
+        }
+      } else {
+        // For BUY transactions, use the original BNB amount
+        console.log(`   📊 Original BUY amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB, Copy ratio: ${(config.copyRatio * 100).toFixed(1)}%`);
+        copyAmount = Math.min(
+          tradeInfo.bnbAmount * config.copyRatio,
+          config.maxPositionSize
+        );
 
-      if (copyAmount < config.minPositionSize) return;
+        console.log(`   💰 BUY copy amount: ${copyAmount.toFixed(6)} BNB, Min position size: ${config.minPositionSize} BNB`);
+        if (copyAmount < config.minPositionSize) {
+          console.log(`   ❌ BUY copy amount too small (${copyAmount.toFixed(6)} < ${config.minPositionSize}), skipping trade`);
+          return;
+        }
+      }
 
       // Log successful detection with clean format
       const timestamp = new Date().toLocaleString();
@@ -352,8 +404,14 @@ export class CopyTradingService {
       this.activeTrades.set(copyTrade.id, copyTrade);
 
       // Execute copy trade with delay
+      console.log(`⏰ Scheduling copy trade execution in ${config.delayMs}ms...`);
       setTimeout(async () => {
-        await this.executeCopyTrade(userId, copyTrade);
+        console.log(`🚀 Executing scheduled copy trade for token ${copyTrade.tokenAddress.slice(0, 8)}...`);
+        try {
+          await this.executeCopyTrade(userId, copyTrade);
+        } catch (error) {
+          console.error(`❌ Error executing copy trade:`, error);
+        }
       }, config.delayMs);
 
     } catch (error) {
@@ -381,6 +439,32 @@ export class CopyTradingService {
   }
 
   /**
+   * Check if an address is a token contract (ERC20)
+   */
+  public static async isTokenContract(address: string): Promise<boolean> {
+    try {
+      // Try to call totalSupply - if it succeeds, it's likely an ERC20 token
+      await publicClient.readContract({
+        address: address as `0x${string}`,
+        abi: [
+          {
+            inputs: [],
+            name: 'totalSupply',
+            outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+            stateMutability: 'view',
+            type: 'function'
+          }
+        ],
+        functionName: 'totalSupply'
+      });
+      return true;
+    } catch (error) {
+      // If totalSupply fails, it's not a token contract
+      return false;
+    }
+  }
+
+  /**
    * Parse transaction data to extract trade information
    */
   public static async parseTransactionData(tx: any): Promise<{
@@ -392,6 +476,12 @@ export class CopyTradingService {
     try {
       const bnbAmount = Number(tx.value) / 1e18;
       const inputData = tx.input;
+      
+      // Validate transaction data
+      if (!tx.to || !tx.from) {
+        console.log(`Invalid transaction: missing to/from address`);
+        return null;
+      }
       
       if (!inputData || inputData === '0x') {
         // Try to analyze using internal transactions and token transfers
@@ -887,6 +977,12 @@ export class CopyTradingService {
     try {
       console.log(`   🔍 Analyzing internal transactions for tx: ${tx.hash}`);
       
+      // Validate transaction hash
+      if (!tx.hash) {
+        console.log(`   ❌ No transaction hash provided`);
+        return null;
+      }
+      
       // Get transaction receipt to access logs
       const receipt = await publicClient.getTransactionReceipt({
         hash: tx.hash as `0x${string}`
@@ -917,79 +1013,82 @@ export class CopyTradingService {
       const fromAddress = tx.from?.toLowerCase();
       const bnbAmount = Number(tx.value) / 1e18;
 
-      // Look for patterns that indicate a BUY transaction:
-      // 1. BNB sent to contract (tx.value > 0)
-      // 2. Tokens received by the user (Transfer TO user)
-      if (bnbAmount > 0) {
-        for (const log of transferLogs) {
-          try {
-            // Decode the transfer log
-            const from = '0x' + (log.topics[1]?.slice(26) || ''); // Remove padding
-            const to = '0x' + (log.topics[2]?.slice(26) || ''); // Remove padding
-            const amount = BigInt(log.data || '0');
+      console.log(`   📊 Analysis: from=${fromAddress}, bnbAmount=${bnbAmount.toFixed(6)} BNB`);
 
-            console.log(`   📝 Transfer: ${from.slice(0, 8)}...${from.slice(-8)} -> ${to.slice(0, 8)}...${to.slice(-8)}`);
-            console.log(`   📝 Amount: ${amount.toString()}`);
-            console.log(`   📝 Token: ${log.address}`);
+      // First, check for SELL patterns (tokens sent FROM user)
+      // This takes priority because SELL transactions can also have BNB value for gas/fees
+      console.log(`   🔍 Checking for SELL patterns (tokens sent FROM user)...`);
+      for (const log of transferLogs) {
+        try {
+          const from = '0x' + (log.topics[1]?.slice(26) || '');
+          const to = '0x' + (log.topics[2]?.slice(26) || '');
+          const amount = BigInt(log.data || '0');
+          const tokenAddress = log.address.toLowerCase();
+          
+          console.log(`     🔄 Transfer: ${from.slice(0, 8)}...${from.slice(-8)} → ${to.slice(0, 8)}...${to.slice(-8)}`);
+          console.log(`     📊 Amount: ${amount.toString()}, Token: ${tokenAddress.slice(0, 8)}...${tokenAddress.slice(-8)}`);
 
-            // If tokens are transferred TO the user, it's likely a BUY
-            if (to.toLowerCase() === fromAddress) {
-              console.log(`   ✅ BUY detected: User received tokens from contract`);
-              console.log(`   📊 Token amount received: ${amount.toString()} raw units`);
-              
-              // Get the correct decimals for this token
-              const decimals = await this.getTokenDecimals(log.address.toLowerCase());
-              const divisor = Math.pow(10, decimals);
-              const tokenAmount = Number(amount) / divisor;
-              
-              console.log(`   📊 Token decimals: ${decimals}, calculated amount: ${tokenAmount} tokens`);
-              return {
-                type: 'BUY',
-                tokenAddress: log.address.toLowerCase(),
-                bnbAmount,
-                tokenAmount
-              };
-            }
-          } catch (logError) {
-            console.log(`   ⚠️  Error decoding log: ${logError}`);
-            continue;
+          // If tokens are transferred FROM the user, it's likely a SELL
+          if (from.toLowerCase() === fromAddress) {
+            console.log(`     ✅ SELL PATTERN FOUND: User ${fromAddress.slice(0, 8)}... is sending tokens to ${to.slice(0, 8)}...`);
+            console.log(`   📊 Token amount sold: ${amount.toString()} raw units`);
+            
+            // Get the correct decimals for this token
+            const decimals = await this.getTokenDecimals(log.address.toLowerCase());
+            const divisor = Math.pow(10, decimals);
+            const tokenAmount = Number(amount) / divisor;
+            
+            console.log(`   📊 Token decimals: ${decimals}, calculated amount: ${tokenAmount} tokens`);
+            return {
+              type: 'SELL',
+              tokenAddress: log.address.toLowerCase(),
+              bnbAmount: bnbAmount, // Keep the actual BNB amount (might be for gas/fees)
+              tokenAmount
+            };
           }
-        }
-      } else {
-        // Look for SELL patterns:
-        // 1. No BNB sent (tx.value = 0)
-        // 2. Tokens sent FROM user to contract
-        for (const log of transferLogs) {
-          try {
-            const from = '0x' + (log.topics[1]?.slice(26) || '');
-            const amount = BigInt(log.data || '0');
-
-            // If tokens are transferred FROM the user, it's likely a SELL
-            if (from.toLowerCase() === fromAddress) {
-              console.log(`   ✅ SELL detected: User sent tokens to contract`);
-              console.log(`   📊 Token amount sold: ${amount.toString()} raw units`);
-              
-              // Get the correct decimals for this token
-              const decimals = await this.getTokenDecimals(log.address.toLowerCase());
-              const divisor = Math.pow(10, decimals);
-              const tokenAmount = Number(amount) / divisor;
-              
-              console.log(`   📊 Token decimals: ${decimals}, calculated amount: ${tokenAmount} tokens`);
-              return {
-                type: 'SELL',
-                tokenAddress: log.address.toLowerCase(),
-                bnbAmount: 0,
-                tokenAmount
-              };
-            }
-          } catch (logError) {
-            console.log(`   ⚠️  Error decoding log: ${logError}`);
-            continue;
-          }
+        } catch (logError) {
+          console.log(`   ⚠️  Error decoding log: ${logError}`);
+          continue;
         }
       }
 
-      console.log(`   ❌ Could not determine trade type from internal transactions`);
+      // If no SELL pattern found, check for BUY patterns (tokens received BY user)
+      console.log(`   🔍 Checking for BUY patterns (tokens received BY user)...`);
+      for (const log of transferLogs) {
+        try {
+          const from = '0x' + (log.topics[1]?.slice(26) || '');
+          const to = '0x' + (log.topics[2]?.slice(26) || '');
+          const amount = BigInt(log.data || '0');
+          const tokenAddress = log.address.toLowerCase();
+          
+          console.log(`     🔄 Transfer: ${from.slice(0, 8)}...${from.slice(-8)} → ${to.slice(0, 8)}...${to.slice(-8)}`);
+          console.log(`     📊 Amount: ${amount.toString()}, Token: ${tokenAddress.slice(0, 8)}...${tokenAddress.slice(-8)}`);
+
+          // If tokens are transferred TO the user, it's likely a BUY
+          if (to.toLowerCase() === fromAddress) {
+            console.log(`     ✅ BUY PATTERN FOUND: User ${fromAddress.slice(0, 8)}... received tokens from ${from.slice(0, 8)}...`);
+            console.log(`   📊 Token amount received: ${amount.toString()} raw units`);
+            
+            // Get the correct decimals for this token
+            const decimals = await this.getTokenDecimals(log.address.toLowerCase());
+            const divisor = Math.pow(10, decimals);
+            const tokenAmount = Number(amount) / divisor;
+            
+            console.log(`   📊 Token decimals: ${decimals}, calculated amount: ${tokenAmount} tokens`);
+            return {
+              type: 'BUY',
+              tokenAddress: log.address.toLowerCase(),
+              bnbAmount,
+              tokenAmount
+            };
+          }
+        } catch (logError) {
+          console.log(`   ⚠️  Error decoding log: ${logError}`);
+          continue;
+        }
+      }
+
+      console.log(`   ❌ NO TRADE PATTERN FOUND: Could not determine if this is a BUY or SELL from internal transactions`);
       return null;
     } catch (error) {
       console.error('Error analyzing internal transactions:', error);
@@ -1023,12 +1122,25 @@ export class CopyTradingService {
     isTradeable: boolean;
   }> {
     try {
+      console.log(`      🔍 Determining platform for token: ${tokenAddress.slice(0, 8)}...`);
+      
+      // Validate token address first
+      if (!tokenAddress || tokenAddress === '0x0000000000000000000000000000000000000000') {
+        console.log(`      ❌ Invalid token address: ${tokenAddress}`);
+        return {
+          platform: 'unknown',
+          isTradeable: false
+        };
+      }
+
       // Check if token is migrated (not tradeable on four.meme)
+      console.log(`      🔍 Getting token info for ${tokenAddress.slice(0, 8)}...`);
       const tokenInfo = await ContractService.getTokenInfo(tokenAddress);
+      console.log(`      📊 Token info retrieved: manager=${tokenInfo.tokenManager.slice(0, 8)}..., liquidity=${tokenInfo.liquidityAdded}, offers=${tokenInfo.offers}`);
       
       // If token manager is zero address, it's migrated to DEX
       if (tokenInfo.tokenManager === '0x0000000000000000000000000000000000000000') {
-        console.log(`Token ${tokenAddress.slice(0, 8)}... has zero token manager - likely migrated`);
+        console.log(`      ✅ Token ${tokenAddress.slice(0, 8)}... has zero token manager - likely migrated to DEX`);
         return {
           platform: 'DEX',
           isTradeable: true // Can be traded on PancakeSwap
@@ -1036,19 +1148,21 @@ export class CopyTradingService {
       }
 
       // Check if we can get buy parameters (token is tradeable on four.meme)
+      console.log(`      🔍 Testing buy params for ${tokenAddress.slice(0, 8)}...`);
       try {
         await ContractService.getBuyParams(tokenAddress, '0.001');
+        console.log(`      ✅ Token ${tokenAddress.slice(0, 8)}... is tradeable on four.meme`);
         return {
           platform: 'four.meme',
           isTradeable: true
         };
       } catch (error) {
         // If four.meme fails, check if it's a known migration pattern
-        console.log(`Token ${tokenAddress.slice(0, 8)}... buy params failed:`, (error as Error).message);
+        console.log(`      ⚠️  Token ${tokenAddress.slice(0, 8)}... buy params failed:`, (error as Error).message);
         
         // Check for specific migration indicators
         if (tokenInfo.liquidityAdded && tokenInfo.offers === 0n) {
-          console.log(`Token ${tokenAddress.slice(0, 8)}... has liquidity but no offers - likely migrated`);
+          console.log(`      ✅ Token ${tokenAddress.slice(0, 8)}... has liquidity but no offers - likely migrated to DEX`);
           return {
             platform: 'DEX',
             isTradeable: true // Can be traded on PancakeSwap
@@ -1056,6 +1170,7 @@ export class CopyTradingService {
         }
         
         // If we can't determine, assume it's not tradeable
+        console.log(`      ❌ Token ${tokenAddress.slice(0, 8)}... could not determine platform - assuming not tradeable`);
         return {
           platform: 'unknown',
           isTradeable: false
@@ -1079,6 +1194,8 @@ export class CopyTradingService {
       // Determine platform for this trade
       const platformInfo = await this.determineTradingPlatform(copyTrade.tokenAddress);
       
+      console.log(`🔍 Testing mode status: ${this.testingMode}`);
+      
       if (this.testingMode) {
         const timestamp = new Date().toLocaleString();
         console.log(`\n🧪 [${timestamp}] COPY SIMULATION`);
@@ -1094,6 +1211,8 @@ export class CopyTradingService {
         return;
       }
 
+      console.log(`🚀 REAL TRADING MODE - Executing actual trade`);
+
       console.log(`🔄 Executing copy trade: ${copyTrade.tradeType} ${copyTrade.copiedAmount} BNB on ${platformInfo.platform}`);
 
       if (copyTrade.tradeType === 'BUY') {
@@ -1108,6 +1227,53 @@ export class CopyTradingService {
           copyTrade.ourTxHash = result.data?.txHash;
           console.log(`✅ Copy buy executed: ${result.data?.txHash}`);
           console.log(`   📊 Used ${result.data?.successCount}/${result.data?.totalWallets} wallets`);
+          
+          // Start price tracking for this token
+          // Note: We'll need to get the actual buy price and token amount from the transaction
+          // For now, we'll use estimated values based on the copy amount
+          try {
+            // Get current price to estimate token amount
+            const priceService = DirectPriceService.getInstance();
+            const priceResult = await priceService.getFourMemeExactPrice(copyTrade.tokenAddress);
+            
+            if (priceResult.success && priceResult.data) {
+              const estimatedTokenAmount = copyTrade.copiedAmount / priceResult.data.avgPrice;
+              
+              // Log copy buy transaction to CSV
+              await this.csvLogger.logBuyTransaction({
+                tokenAddress: copyTrade.tokenAddress,
+                tokenName: 'Unknown',
+                tokenCreator: 'Unknown',
+                platform: platformInfo.platform as 'four.meme' | 'PancakeSwap',
+                buyAmountBNB: copyTrade.copiedAmount,
+                tokenAmount: estimatedTokenAmount,
+                buyPriceBNB: priceResult.data.avgPrice,
+                buyPriceUSD: priceResult.data.priceUSD,
+                maxPriceReachedBNB: priceResult.data.avgPrice,
+                maxPriceReachedUSD: priceResult.data.priceUSD,
+                priceChangePercent: 0,
+                maxPriceChangePercent: 0,
+                buyTime: new Date(),
+                userId,
+                walletAddress: '0x50d1C20D42e4535123Ff3a8889Cbc2a7A1397F45'
+              });
+              
+              await this.priceTrackingService.startTrackingToken(
+                copyTrade.tokenAddress,
+                priceResult.data.avgPrice, // Price in BNB
+                priceResult.data.priceUSD, // USD price
+                copyTrade.copiedAmount, // BNB amount spent
+                estimatedTokenAmount, // Estimated token amount received
+                userId,
+                '0x50d1C20D42e4535123Ff3a8889Cbc2a7A1397F45' // Use your wallet address for copy trading
+              );
+              console.log(`📈 Started price tracking for copied token`);
+            } else {
+              console.log(`⚠️ Could not get price for tracking, skipping price tracking setup`);
+            }
+          } catch (error) {
+            console.error(`⚠️ Failed to start price tracking:`, error);
+          }
           
           // Send Telegram alert
           await TelegramBotService.sendCopyTradeAlert({
@@ -1133,6 +1299,7 @@ export class CopyTradingService {
           }
         }
       } else if (copyTrade.tradeType === 'SELL') {
+        console.log(`🔄 Executing SELL copy trade for token ${copyTrade.tokenAddress.slice(0, 8)}...`);
         // For sell, we need to check if we have tokens to sell
         const sellResult = await this.executeSellCopy(userId, copyTrade);
         
@@ -1140,6 +1307,19 @@ export class CopyTradingService {
           copyTrade.status = 'EXECUTED';
           copyTrade.ourTxHash = sellResult.txHash;
           console.log(`✅ Copy sell executed: ${sellResult.txHash}`);
+          
+          // Trigger copy sell in price tracking service
+          try {
+            // For copy sell, sell 100% of tokens
+            await this.priceTrackingService.copySellToken(
+              copyTrade.tokenAddress,
+              userId,
+              100 // Always sell 100% when copying a SELL transaction
+            );
+            console.log(`📈 Triggered copy sell in price tracking service`);
+          } catch (error) {
+            console.error(`⚠️ Failed to trigger copy sell in price tracking:`, error);
+          }
           
           // Send Telegram alert
           await TelegramBotService.sendCopyTradeAlert({
@@ -1257,12 +1437,13 @@ export class CopyTradingService {
         return { success: false, error: 'No tokens to sell' };
       }
 
-      // Calculate total tokens to sell based on copy ratio
+      // For SELL copy trades, sell ALL tokens (100%)
+      // Copy ratio is not used for sell transactions
       const totalTokens = walletsWithToken.reduce((sum, wallet) => sum + wallet.balance, 0n);
-      const sellPercentage = Math.floor(copyTrade.copyRatio * 100); // Convert ratio to percentage
+      const sellPercentage = 100; // Always sell 100% when copying a SELL transaction
 
-      if (sellPercentage === 0) {
-        return { success: false, error: 'Not enough tokens to sell' };
+      if (totalTokens === 0n) {
+        return { success: false, error: 'No tokens to sell' };
       }
 
       console.log(`🔄 Copy selling ${sellPercentage}% of ${totalTokens.toString()} tokens`);
@@ -1297,5 +1478,54 @@ export class CopyTradingService {
    */
   private static generateId(): string {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
+  }
+
+  /**
+   * Get price tracking service instance
+   */
+  static getPriceTrackingService(): PriceTrackingService {
+    return this.priceTrackingService;
+  }
+
+  /**
+   * Get tracked tokens for a user
+   */
+  static getTrackedTokens(userId: string) {
+    return this.priceTrackingService.getTrackedTokens(userId);
+  }
+
+  /**
+   * Get all tracked tokens
+   */
+  static getAllTrackedTokens() {
+    return this.priceTrackingService.getAllTrackedTokens();
+  }
+
+  /**
+   * Update price tracking configuration
+   */
+  static updatePriceTrackingConfig(config: any) {
+    this.priceTrackingService.updateConfig(config);
+  }
+
+  /**
+   * Get price tracking configuration
+   */
+  static getPriceTrackingConfig() {
+    return this.priceTrackingService.getConfig();
+  }
+
+  /**
+   * Manually remove a token from price tracking
+   */
+  static async removeTokenFromTracking(tokenAddress: string, userId: string, walletAddress: string) {
+    return await this.priceTrackingService.removeToken(tokenAddress, userId, walletAddress);
+  }
+
+  /**
+   * Get price tracking statistics
+   */
+  static getPriceTrackingStats() {
+    return this.priceTrackingService.getTrackingStats();
   }
 }

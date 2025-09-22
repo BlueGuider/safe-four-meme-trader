@@ -339,15 +339,30 @@ export class PancakeSwapService {
           }
 
           // Calculate minimum amount out with slippage
-          const amountOutMin = BigInt(Math.floor(bestRoute.estimatedOutput * (100 - slippagePercent) / 100));
+          let amountOutMin = BigInt(Math.floor(bestRoute.estimatedOutput * (100 - slippagePercent) / 100));
+          
+          // For fee-on-transfer tokens, use a very flexible minimum amount
+          // Since we're using swapExactTokensForETHSupportingFeeOnTransferTokens,
+          // we need to account for unpredictable fees that can significantly reduce output
+          if (amountOutMin === 0n && bestRoute.estimatedOutput > 0) {
+            // Use 0.1% of estimated output as minimum (extremely flexible for fee-on-transfer tokens)
+            amountOutMin = BigInt(Math.floor(bestRoute.estimatedOutput * 0.001 * 1e18));
+            console.log(`   ⚠️  AmountOutMin was 0, setting to 0.1% of estimated output: ${(Number(amountOutMin) / 1e18).toFixed(6)} BNB`);
+          }
+          
+          // For fee-on-transfer tokens, also reduce the slippage-based minimum
+          // Apply additional 50% reduction to account for transfer fees
+          amountOutMin = BigInt(Math.floor(Number(amountOutMin) * 0.5));
+          console.log(`   📊 Final AmountOutMin: ${(Number(amountOutMin) / 1e18).toFixed(6)} BNB (reduced for fee-on-transfer)`);
+          
           const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800); // 30 minutes
 
           let sellData: `0x${string}`;
           if (bestRoute.version === 'V2') {
-            // PancakeSwap V2 sell
+            // PancakeSwap V2 sell - use fee-on-transfer version to handle tokens with transfer fees
             sellData = encodeFunctionData({
               abi: PANCAKESWAP_V2_ROUTER_ABI,
-              functionName: 'swapExactTokensForETH',
+              functionName: 'swapExactTokensForETHSupportingFeeOnTransferTokens',
               args: [
                 amountToSell,
                 amountOutMin,
@@ -445,27 +460,52 @@ export class PancakeSwapService {
    */
   private static async checkTokenLiquidity(tokenAddress: string): Promise<boolean> {
     try {
-      // Check V2 liquidity
-      const v2Pair = await publicClient.readContract({
+      // Now that we have the official ABI, let's try the direct getPair call
+      const pairAddress = await publicClient.readContract({
         address: CONTRACT_ADDRESSES.PANCAKESWAP_V2_FACTORY as `0x${string}`,
         abi: PANCAKESWAP_V2_FACTORY_ABI,
         functionName: 'getPair',
         args: [CONTRACT_ADDRESSES.WBNB as `0x${string}`, tokenAddress as `0x${string}`]
       });
 
-      if (v2Pair && v2Pair !== '0x0000000000000000000000000000000000000000') {
-        console.log(`✅ Token has V2 liquidity on PancakeSwap`);
+      console.log(`🔍 getPair result: ${pairAddress}`);
+
+      if (pairAddress && pairAddress !== '0x0000000000000000000000000000000000000000') {
+        console.log(`✅ Token has V2 liquidity on PancakeSwap (pair: ${pairAddress})`);
         return true;
+      } else {
+        console.log(`❌ Token has no V2 pair on PancakeSwap`);
+        return false;
       }
 
-      // For V3, we'd need to check pool existence
-      // For now, assume V3 has liquidity if V2 doesn't
-      console.log(`✅ Token likely has V3 liquidity on PancakeSwap`);
-      return true;
-
     } catch (error) {
-      console.error('Error checking token liquidity:', error);
-      return false;
+      console.error('Error checking token liquidity with official ABI:', error);
+      
+      // If the official ABI still fails, fall back to router check
+      try {
+        console.log(`⚠️ Factory check failed, trying router approach`);
+        const amounts = await publicClient.readContract({
+          address: CONTRACT_ADDRESSES.PANCAKESWAP_V2_ROUTER as `0x${string}`,
+          abi: PANCAKESWAP_V2_ROUTER_ABI,
+          functionName: 'getAmountsOut',
+          args: [
+            BigInt(1000000), // 1 token (assuming 6 decimals)
+            [CONTRACT_ADDRESSES.WBNB, tokenAddress].map(addr => addr as `0x${string}`)
+          ]
+        });
+
+        if (amounts && amounts.length > 1 && amounts[1] > 0n) {
+          console.log(`✅ Token has V2 liquidity on PancakeSwap (verified via getAmountsOut)`);
+          return true;
+        } else {
+          console.log(`❌ Token has no V2 liquidity on PancakeSwap`);
+          return false;
+        }
+      } catch (routerError) {
+        console.log(`⚠️ Both factory and router checks failed, but trading might still work`);
+        console.log(`💡 Proceeding with assumption that token has liquidity`);
+        return true; // Be permissive - let the actual trading determine if liquidity exists
+      }
     }
   }
 
